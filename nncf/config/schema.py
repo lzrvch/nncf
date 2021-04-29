@@ -364,11 +364,31 @@ QUANTIZATION_INITIALIZER_SCHEMA = {
     "additionalProperties": False,
 }
 
+ACCURACY_AWARE_SCHEMA = {
+    "maximal_accuracy_degradation": with_attributes(_NUMBER,
+                                                    description="Maximally allowed accuracy degradation"
+                                                                " of the model"),
+    "initial_training_phase_epochs": with_attributes(_NUMBER,
+                                                     description="Number of epochs to tune during the initial"
+                                                                 "training phase"),
+    "initial_compression_rate_step": with_attributes(_NUMBER,
+                                                      description="initial_compression_rate_step"),
+    "compression_rate_step_reduction_factor":  with_attributes(_NUMBER,
+                                                      description="compression_rate_step_reduction_factor"),
+    "minimal_compression_rate_step":  with_attributes(_NUMBER,
+                                                      description="minimal_compression_rate_step"),
+    "patience_epochs":  with_attributes(_NUMBER,
+                                        description="patience epochs"),
+    "maximal_total_epochs":  with_attributes(_NUMBER,
+                                        description="maximal_total_epochs"),
+}
+
 COMMON_COMPRESSION_ALGORITHM_PROPERTIES = {
     "ignored_scopes": with_attributes(make_string_or_array_of_strings_schema(),
                                       description=IGNORED_SCOPES_DESCRIPTION),
     "target_scopes": with_attributes(make_string_or_array_of_strings_schema(),
                                      description=TARGET_SCOPES_DESCRIPTION),
+    "accuracy_aware_training": ACCURACY_AWARE_SCHEMA,
 }
 
 BASIC_COMPRESSION_ALGO_SCHEMA = {
@@ -602,6 +622,18 @@ RB_SPARSITY_SCHEMA = {
     "additionalProperties": False
 }
 
+KNOWLEDGE_DISTILLATION_ALGO_NAME_IN_CONFIG = 'knowledge_distillation'
+KNOWLEDGE_DISTILLATION_SCHEMA = {
+    **BASIC_COMPRESSION_ALGO_SCHEMA,
+    "properties": {
+        "algorithm": {
+            "const": KNOWLEDGE_DISTILLATION_ALGO_NAME_IN_CONFIG
+        },
+    },
+    "additionalProperties": False
+}
+
+
 FILTER_PRUNING_ALGO_NAME_IN_CONFIG = 'filter_pruning'
 FILTER_PRUNING_SCHEMA = {
     **BASIC_COMPRESSION_ALGO_SCHEMA,
@@ -634,6 +666,10 @@ FILTER_PRUNING_SCHEMA = {
                                                      description="Number of epochs during which the pruning rate is"
                                                                  " increased from `pruning_init` to `pruning_target`"
                                                                  " value."),
+                    "filter_importance": with_attributes(_STRING,
+                                                         description="The type of filter importance metric. Can be"
+                                                                     " one of `L1`, `L2`, `geometric_median`."
+                                                                     " `L2` by default."),
                     "weight_importance": with_attributes(_STRING,
                                                          description="The type of filter importance metric. Can be"
                                                                      " one of `L1`, `L2`, `geometric_median`."
@@ -643,6 +679,26 @@ FILTER_PRUNING_SCHEMA = {
                                                                " with the smallest importance in each layer separately)"
                                                                " or not. `False` by default.",
                                                    default=False),
+                    "save_ranking_coeffs_path": with_attributes(_STRING),
+                    "load_ranking_coeffs_path": with_attributes(_STRING),
+                    "legr_params":
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "generations": with_attributes(_NUMBER,
+                                                                       description="Number of generations for evolution"
+                                                                                   "algorithm."),
+                                        "train_steps": with_attributes(_NUMBER,
+                                                                       description="Number of training steps to estimate"
+                                                                                   "pruned model accuracy."),
+                                        "max_pruning": with_attributes(_NUMBER,
+                                                                       description="Maximum possible pruning level for "
+                                                                                   "the model to train LeGR algo on it."),
+                                        "random_seed": with_attributes(_NUMBER,
+                                                                       description="Random seed for LeGR coefficients"
+                                                                                   " generation.")
+                                    }
+                                },
                     "prune_first_conv": with_attributes(_BOOLEAN,
                                                         description="Whether to prune first Convolutional layers or"
                                                                     " not. First means that it is a convolutional layer"
@@ -690,37 +746,20 @@ ALL_SUPPORTED_ALGO_SCHEMA = [BINARIZATION_SCHEMA,
                              CONST_SPARSITY_SCHEMA,
                              MAGNITUDE_SPARSITY_SCHEMA,
                              RB_SPARSITY_SCHEMA,
-                             FILTER_PRUNING_SCHEMA]
+                             FILTER_PRUNING_SCHEMA,
+                             KNOWLEDGE_DISTILLATION_SCHEMA]
 
 REF_VS_ALGO_SCHEMA = {BINARIZATION_ALGO_NAME_IN_CONFIG: BINARIZATION_SCHEMA,
                       QUANTIZATION_ALGO_NAME_IN_CONFIG: QUANTIZATION_SCHEMA,
                       CONST_SPARSITY_ALGO_NAME_IN_CONFIG: CONST_SPARSITY_SCHEMA,
                       MAGNITUDE_SPARSITY_ALGO_NAME_IN_CONFIG: MAGNITUDE_SPARSITY_SCHEMA,
                       RB_SPARSITY_ALGO_NAME_IN_CONFIG: RB_SPARSITY_SCHEMA,
-                      FILTER_PRUNING_ALGO_NAME_IN_CONFIG: FILTER_PRUNING_SCHEMA}
+                      FILTER_PRUNING_ALGO_NAME_IN_CONFIG: FILTER_PRUNING_SCHEMA,
+                      KNOWLEDGE_DISTILLATION_ALGO_NAME_IN_CONFIG: KNOWLEDGE_DISTILLATION_SCHEMA}
 
 TARGET_DEVICE_SCHEMA = {
     "type": "string",
     "enum": ["ANY", "CPU", "GPU", "VPU", "TRIAL"]
-}
-
-ACCURACY_AWARE_SCHEMA = {
-    "maximal_accuracy_degradation": with_attributes(_NUMBER,
-                                                    description="Maximally allowed accuracy degradation"
-                                                                " of the model"),
-    "initial_training_phase_epochs": with_attributes(_NUMBER,
-                                                     description="Number of epochs to tune during the initial"
-                                                                 "training phase"),
-    "initial_compression_rate_step": with_attributes(_NUMBER,
-                                                      description="initial_compression_rate_step"),
-    "compression_rate_step_reduction_factor":  with_attributes(_NUMBER,
-                                                      description="compression_rate_step_reduction_factor"),
-    "minimal_compression_rate_step":  with_attributes(_NUMBER,
-                                                      description="minimal_compression_rate_step"),
-    "patience_epochs":  with_attributes(_NUMBER,
-                                        description="patience epochs"),
-    "maximal_total_epochs":  with_attributes(_NUMBER,
-                                        description="maximal_total_epochs"),
 }
 
 
@@ -750,8 +789,6 @@ ROOT_NNCF_CONFIG_SCHEMA = {
         # This is required for better user feedback, since holistic schema validation is uninformative
         # if there is an error in one of the compression configs.
         "compression": make_object_or_array_of_objects_schema(BASIC_COMPRESSION_ALGO_SCHEMA),
-        "accuracy_aware_training_config": with_attributes(ACCURACY_AWARE_SCHEMA,
-                                   description="Accuracy aware training config"),
         "target_device": with_attributes(TARGET_DEVICE_SCHEMA,
                                          description="The target device, the specificity of which will be taken into "
                                                      "account while compressing in order to obtain the best "

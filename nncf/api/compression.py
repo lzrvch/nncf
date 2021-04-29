@@ -170,7 +170,7 @@ class CompressionAlgorithmController(ABC):
 
     @property
     @abstractmethod
-    def loss(self) -> CompressionLoss:
+    def loss(self, input_, target) -> CompressionLoss:
         """
         :return: The instance of the `CompressionLoss`.
         """

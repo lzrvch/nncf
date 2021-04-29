@@ -34,11 +34,12 @@ from examples.common.utils import configure_logging, configure_paths, create_cod
     is_pretrained_model_requested, log_common_mlflow_params, SafeMLFLow, configure_device
 from examples.common.utils import write_metrics
 from nncf import create_compressed_model
-from nncf import run_accuracy_aware_compressed_training, PTAccuracyAwareTrainingRunner
+from nncf import run_accuracy_aware_compressed_training
 from nncf.initialization import register_default_init_args
 from nncf.initialization import register_training_loop_args
 from nncf.initialization import default_criterion_fn
 from nncf.utils import is_main_process
+from nncf.structures import ExecutionParameters
 from examples.classification.common import set_seed, load_resuming_checkpoint
 
 model_names = sorted(name for name in models.__dict__
@@ -119,13 +120,28 @@ def main_worker(current_gpu, config: SampleConfig):
         train_dataset, val_dataset = create_datasets(config)
         train_loader, _, val_loader, init_loader = create_data_loaders(config, train_dataset, val_dataset)
 
-        def evaluation_fn(model, eval_loader):
-            top1, _ = validate(eval_loader, model, criterion, config)
-            return top1
+        def evaluation_fn(model, eval_loader, log=True):
+            top1, top5, loss = validate(eval_loader, model, criterion, config, log)
+            return top1, top5, loss
+
+        def train_steps_fn(loader, model, optimizer, compression_ctrl, train_steps):
+            train_epoch(loader, model, criterion, train_criterion_fn, optimizer, compression_ctrl, 0, config,
+                        train_iters=train_steps, log_training_info=False)
+
+        execution_params = ExecutionParameters(config.cpu_only,
+                                               config.current_gpu)
 
         nncf_config = register_default_init_args(
-            nncf_config, init_loader, criterion, train_criterion_fn,
-            evaluation_fn, val_loader, config.device)
+            nncf_config, init_loader,
+            train_loader=train_loader,
+            criterion=criterion,
+            criterion_fn=train_criterion_fn,
+            train_steps_fn=train_steps_fn,
+            validate_fn=evaluation_fn,
+            val_loader=val_loader,
+            device=config.device,
+            execution_parameters=execution_params,
+            )
 
     # create model
     model = load_model(model_name,
@@ -166,7 +182,7 @@ def main_worker(current_gpu, config: SampleConfig):
         # validation function that returns the target metric value
         # pylint: disable=E1123
         def validate_fn(model, epoch):
-            top1, _ = validate(val_loader, model, criterion, config, epoch=epoch)
+            top1, _, _ = validate(val_loader, model, criterion, config, epoch=epoch, log_validation_info=True)
             return top1
 
         # training function that trains the model for one epoch (full training dataset pass)
@@ -187,8 +203,7 @@ def main_worker(current_gpu, config: SampleConfig):
                                                   log_dir=config.log_dir)
 
         # run accuracy-aware training loop
-        training_runner = PTAccuracyAwareTrainingRunner(nncf_config)
-        model = run_accuracy_aware_compressed_training(model, compression_ctrl, training_runner)
+        model = run_accuracy_aware_compressed_training(model, compression_ctrl, nncf_config)
 
 
 if __name__ == '__main__':

@@ -42,6 +42,7 @@ if __nncf_backend__ == 'Torch':
     from .sparsity.magnitude import algo as magnitude_sparsity_algo
     from .sparsity.rb import algo as rb_sparsity_algo
     from .pruning.filter_pruning import algo as filter_pruning_algo
+    from . import kd_loss as knowledge_distillation_algo
 
     # Functions most commonly used in integrating NNCF into training pipelines are
     # listed below for importing convenience
@@ -56,7 +57,6 @@ if __nncf_backend__ == 'Torch':
     from .dynamic_graph.io_handling import nncf_model_input
     from .dynamic_graph.io_handling import nncf_model_output
     from .common.accuracy_aware_training.algo import run_accuracy_aware_compressed_training
-    from .accuracy_aware_training.runner import PTAccuracyAwareTrainingRunner
 
     # NNCF relies on tracing PyTorch operations. Each code that uses NNCF
     # should be executed with PyTorch operators wrapped via a call to "patch_torch_operators",
