@@ -18,9 +18,14 @@ from pathlib import Path
 import tensorflow as tf
 import numpy as np
 
+
+from nncf import AdaptiveCompressionTrainingLoop
+from nncf.structures import ModelEvaluationArgs
 from beta.nncf import create_compressed_model
 from beta.nncf.helpers.utils import print_statistics
 from beta.nncf.tensorflow.helpers.model_manager import TFOriginalModelManager
+from beta.nncf.tensorflow.accuracy_aware_training.runner import TFAccuracyAwareTrainingRunner as \
+        AccuracyAwareTrainingRunner
 
 from beta.examples.tensorflow.common.argparser import get_common_argument_parser
 from beta.examples.tensorflow.common.distributed import get_distribution_strategy
@@ -37,6 +42,7 @@ from beta.examples.tensorflow.common.utils import configure_paths
 from beta.examples.tensorflow.common.utils import get_saving_parameters
 from beta.examples.tensorflow.common.utils import write_metrics
 from beta.examples.tensorflow.common.utils import get_scheduler_state
+from beta.examples.tensorflow.common.utils import is_accuracy_aware_training
 from beta.examples.tensorflow.object_detection.models.model_selector import get_predefined_config
 from beta.examples.tensorflow.object_detection.models.model_selector import get_model_builder
 
@@ -103,19 +109,15 @@ def load_checkpoint(checkpoint, ckpt_path):
     status = checkpoint.restore(path_to_checkpoint)
     status.expect_partial()
     logger.info('Completed loading from checkpoint')
-
     return None
 
 
-def resume_from_checkpoint(checkpoint_manager, compression_ctrl, ckpt_path, steps_per_epoch, config):
+def resume_from_checkpoint(checkpoint_manager, ckpt_path, steps_per_epoch):
     if load_checkpoint(checkpoint_manager.checkpoint, ckpt_path) == 0:
         return 0
     optimizer = checkpoint_manager.checkpoint.optimizer
     initial_step = optimizer.iterations.numpy()
     initial_epoch = initial_step // steps_per_epoch
-
-    scheduler_state = get_scheduler_state(initial_step, steps_per_epoch, config)
-    compression_ctrl.scheduler.load_state(scheduler_state)
 
     logger.info('Resuming from epoch %d (global step %d)', initial_epoch, initial_step)
     return initial_epoch, initial_step
@@ -169,6 +171,36 @@ def create_train_step_fn(strategy, model, loss_fn, optimizer):
     return train_step
 
 
+def train_epoch(train_step, compression_ctrl, epoch, initial_epoch, steps_per_epoch, optimizer, checkpoint_manager,
+                train_dist_dataset, train_summary_writer, initial_step, print_freq, timer):
+    compression_ctrl.scheduler.epoch_step(epoch)
+
+    for step, x in enumerate(train_dist_dataset):
+        if epoch == initial_epoch and step < initial_step % steps_per_epoch:
+            continue
+        if step == steps_per_epoch:
+            save_path = checkpoint_manager.save()
+            logger.info('Saved checkpoint for epoch={}: {}'.format(epoch, save_path))
+            break
+
+        compression_ctrl.scheduler.step()
+        train_loss = train_step(x)
+        train_metric_result = tf.nest.map_structure(lambda s: s.numpy().astype(float), train_loss)
+
+        if np.isnan(train_metric_result['total_loss']):
+            raise ValueError('total loss is NaN')
+
+        train_metric_result.update({'learning_rate': optimizer.lr(optimizer.iterations).numpy()})
+
+        train_summary_writer(metrics=train_metric_result, step=optimizer.iterations.numpy())
+
+        if step % print_freq == 0:
+            time = timer.toc(average=False)
+            logger.info('Step: {}/{} Time: {:.3f} sec'.format(step, steps_per_epoch, time))
+            logger.info('Training metric = {}'.format(train_metric_result))
+            timer.tic()
+
+
 def train(train_step, test_step, eval_metric, train_dist_dataset, test_dist_dataset, initial_epoch, initial_step,
     epochs, steps_per_epoch, checkpoint_manager, compression_ctrl, log_dir, optimizer, num_test_batches, print_freq):
 
@@ -182,32 +214,10 @@ def train(train_step, test_step, eval_metric, train_dist_dataset, test_dist_data
     logger.info('Training...')
     for epoch in range(initial_epoch, epochs):
         logger.info('Epoch: {}/{}'.format(epoch, epochs))
-        compression_ctrl.scheduler.epoch_step(epoch)
 
-        for step, x in enumerate(train_dist_dataset):
-            if epoch == initial_epoch and step < initial_step % steps_per_epoch:
-                continue
-            if step == steps_per_epoch:
-                save_path = checkpoint_manager.save()
-                logger.info('Saved checkpoint for epoch={}: {}'.format(epoch, save_path))
-                break
-
-            compression_ctrl.scheduler.step()
-            train_loss = train_step(x)
-            train_metric_result = tf.nest.map_structure(lambda s: s.numpy().astype(float), train_loss)
-
-            if np.isnan(train_metric_result['total_loss']):
-                raise ValueError('total loss is NaN')
-
-            train_metric_result.update({'learning_rate': optimizer.lr(optimizer.iterations).numpy()})
-
-            train_summary_writer(metrics=train_metric_result, step=optimizer.iterations.numpy())
-
-            if step % print_freq == 0:
-                time = timer.toc(average=False)
-                logger.info('Step: {}/{} Time: {:.3f} sec'.format(step, steps_per_epoch, time))
-                logger.info('Training metric = {}'.format(train_metric_result))
-                timer.tic()
+        train_epoch(train_step, compression_ctrl, epoch, initial_epoch, steps_per_epoch,
+                optimizer, checkpoint_manager, train_dist_dataset, train_summary_writer,
+                initial_step, print_freq, timer)
 
         test_metric_result = evaluate(test_step, eval_metric, test_dist_dataset, num_test_batches, print_freq)
         validation_summary_writer(metrics=test_metric_result, step=optimizer.iterations.numpy())
@@ -260,6 +270,8 @@ def run(config):
     if config.metrics_dump is not None:
         write_metrics(0, config.metrics_dump)
 
+    is_accuracy_aware_training_mode = is_accuracy_aware_training(config)
+
     # Create dataset
     builders = get_dataset_builders(config, strategy.num_replicas_in_sync)
     datasets = [builder.build() for builder in builders]
@@ -276,10 +288,18 @@ def run(config):
     # Create model builder
     model_builder = get_model_builder(config)
 
+    def model_eval_fn(model):
+        test_step = create_test_step_fn(strategy, model, model_builder.post_processing)
+        metric_result = evaluate(test_step, model_builder.eval_metrics(), test_dist_dataset,
+                                 num_test_batches, config.print_freq)
+        return metric_result['AP']
+
     with TFOriginalModelManager(model_builder.build_model,
                                 weights=config.get('weights', None)) as model:
         with strategy.scope():
-            compression_ctrl, compress_model = create_compressed_model(model, config.nncf_config)
+            config.nncf_config.register_extra_structs([ModelEvaluationArgs(eval_fn=model_eval_fn)])
+            compression_ctrl, compress_model = create_compressed_model(model, config.nncf_config,
+                                                                       should_eval_original_model=is_accuracy_aware_training_mode)
 
             scheduler = build_scheduler(
                 config=config,
@@ -293,22 +313,50 @@ def run(config):
             loss_fn = model_builder.build_loss_fn(compress_model, compression_ctrl.loss)
             predict_post_process_fn = model_builder.post_processing
 
-            checkpoint = tf.train.Checkpoint(model=compress_model, optimizer=optimizer)
+            checkpoint = tf.train.Checkpoint(model=compress_model,
+                                             optimizer=optimizer,
+                                             compression_ctrl=compression_ctrl)
             checkpoint_manager = tf.train.CheckpointManager(checkpoint, config.checkpoint_save_dir, max_to_keep=None)
 
             initial_epoch = initial_step = 0
             if config.ckpt_path:
                 initial_epoch, initial_step = resume_from_checkpoint(checkpoint_manager,
-                                                                     compression_ctrl,
                                                                      config.ckpt_path,
-                                                                     steps_per_epoch,
-                                                                     config)
+                                                                     steps_per_epoch)
             else:
                 logger.info('Initialization...')
                 compression_ctrl.initialize(dataset=train_dataset)
 
     train_step = create_train_step_fn(strategy, compress_model, loss_fn, optimizer)
     test_step = create_test_step_fn(strategy, compress_model, predict_post_process_fn)
+
+    if 'train' in config.mode and is_accuracy_aware_training_mode:
+
+        train_summary_writer = SummaryWriter(config.log_dir, 'train')
+        timer = Timer()
+        timer.tic()
+
+        def train_epoch_fn(compression_ctrl, model, epoch):
+            train_step = create_train_step_fn(strategy, model, loss_fn, optimizer)
+            train_epoch(train_step, compression_ctrl, epoch, initial_epoch, steps_per_epoch,
+                optimizer, checkpoint_manager, train_dist_dataset, train_summary_writer,
+                initial_step, config.print_freq, timer)
+
+        def validate_fn(model, epoch):
+            test_step = create_test_step_fn(strategy, model, predict_post_process_fn)
+            metric_result = evaluate(test_step, eval_metric, test_dist_dataset,
+                                     num_test_batches, config.print_freq)
+            return metric_result['AP']
+
+        # instantiate and run accuracy-aware training loop
+        acc_aware_training_loop = AdaptiveCompressionTrainingLoop(config.nncf_config, compression_ctrl,
+                                                            runner_cls=AccuracyAwareTrainingRunner)
+        compress_model = acc_aware_training_loop.run(compress_model,
+                                                     train_epoch_fn=train_epoch_fn,
+                                                     validate_fn=validate_fn,
+                                                     tensorboard_writer=config.tb,
+                                                     log_dir=config.log_dir)
+        return
 
     if 'train' in config.mode:
         train(train_step, test_step, eval_metric, train_dist_dataset, test_dist_dataset, initial_epoch, initial_step,

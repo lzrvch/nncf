@@ -128,6 +128,9 @@ class SafeMLFLow:
         return Maybe.from_value(self._get_mlflow()).bind(
             lambda obj: Maybe.from_value(getattr(obj, func)(*args, **kwargs)))
 
+    def end_run(self):
+        self.safe_call('end_run')
+
     def _is_enabled(self):
         return self.is_suitable_mode and is_main_process()
 
@@ -235,6 +238,18 @@ def is_staged_quantization(config):
     if algo_type is not None and algo_type == "binarization":
         return True
     if algo_type == "quantization" and compression_config.get("params", {}):
+        return True
+    return False
+
+
+def is_accuracy_aware_training(config):
+    compression_config = config.get('compression', {})
+    if isinstance(compression_config, list):
+        for algo_config in compression_config:
+            if algo_config.get("accuracy_aware_training") is not None:
+                return True
+        return False
+    if compression_config.get("accuracy_aware_training") is not None:
         return True
     return False
 

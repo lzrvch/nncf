@@ -11,13 +11,15 @@
  limitations under the License.
 """
 
-import tensorflow as tf
 from tensorflow.python.keras.utils.layer_utils import count_params
 from typing import List
+
+import tensorflow as tf
 
 from nncf.common.graph.transformations.commands import TransformationPriority
 from nncf.common.graph.transformations.layout import TransformationLayout
 from nncf.common.sparsity.schedulers import SPARSITY_SCHEDULERS
+from nncf.common.sparsity.schedulers import SparsityScheduler
 from beta.nncf.tensorflow.algorithm_selector import TF_COMPRESSION_ALGORITHMS
 from beta.nncf.tensorflow.api.compression import TFCompressionAlgorithmBuilder
 from beta.nncf.tensorflow.graph.transformations.commands import TFInsertionCommand
@@ -32,16 +34,14 @@ from beta.nncf.tensorflow.sparsity.rb.operation import RBSparsifyingWeight
 from beta.nncf.tensorflow.sparsity.rb.functions import binary_mask
 from beta.nncf.tensorflow.sparsity.utils import apply_fn_to_op_weights
 from beta.nncf.tensorflow.utils.node import is_ignored
-from nncf.api.compression import CompressionLoss
-from nncf.api.compression import CompressionScheduler
+
+from nncf.common.accuracy_aware_training.training_loop import ADAPTIVE_COMPRESSION_CONTROLLERS
+from nncf.common.schedulers import StubCompressionScheduler
 
 
 @TF_COMPRESSION_ALGORITHMS.register('rb_sparsity')
 class RBSparsityBuilder(TFCompressionAlgorithmBuilder):
     def __init__(self, config):
-        if isinstance(tf.distribute.get_strategy(), tf.distribute.MirroredStrategy):
-            raise Exception('RB sparsity algorithm does not support the distributed mode with mirrored strategy')
-
         super().__init__(config)
         self.ignored_scopes = self.config.get('ignored_scopes', [])
         self._op_names = []
@@ -85,6 +85,7 @@ class RBSparsityBuilder(TFCompressionAlgorithmBuilder):
         return RBSparsityController(model, self.config, self._op_names)
 
 
+@ADAPTIVE_COMPRESSION_CONTROLLERS.register('rb_sparsity')
 class RBSparsityController(BaseSparsityController):
     def __init__(self, target_model, config, op_names: List[str]):
         super().__init__(target_model, op_names)
@@ -99,16 +100,20 @@ class RBSparsityController(BaseSparsityController):
         target_ops = apply_fn_to_op_weights(target_model, op_names)
         self._loss = SparseLoss(target_ops)
         schedule_type = params.get('schedule', 'exponential')
+
+        if schedule_type == 'adaptive':
+            raise NotImplementedError('RB sparsity algorithm do not support adaptive scheduler')
+
         scheduler_cls = SPARSITY_SCHEDULERS.get(schedule_type)
         self._scheduler = scheduler_cls(self, params)
         self.set_sparsity_level(sparsity_init)
 
     @property
-    def scheduler(self) -> CompressionScheduler:
+    def scheduler(self) -> SparsityScheduler:
         return self._scheduler
 
     @property
-    def loss(self) -> CompressionLoss:
+    def loss(self) -> SparseLoss:
         return self._loss
 
     def set_sparsity_level(self, sparsity_level):
@@ -116,6 +121,17 @@ class RBSparsityController(BaseSparsityController):
 
     def freeze(self):
         self._loss.disable()
+
+    @property
+    def compression_rate(self) -> float:
+        return self.raw_statistics()['sparsity_rate_for_model']
+
+    @compression_rate.setter
+    def compression_rate(self, compression_rate: float) -> None:
+        self.set_sparsity_level(compression_rate)
+
+    def disable_scheduler(self):
+        self._scheduler = StubCompressionScheduler()
 
     def raw_statistics(self):
         raw_sparsity_statistics = {}

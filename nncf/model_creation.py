@@ -13,7 +13,9 @@
 from os import path as osp
 from typing import Callable, Any, Tuple, Dict
 
+import torch
 from torch.nn import Module
+from torch.distributed import barrier
 
 from nncf.checkpoint_loading import load_state
 from nncf.composite_compression import PTCompositeCompressionAlgorithmBuilder
@@ -24,6 +26,7 @@ from nncf.dynamic_graph.graph_tracer import create_input_infos, create_dummy_for
 from nncf.graph.graph_builder import GraphBuilder
 from nncf.nncf_network import NNCFNetwork
 from nncf.utils import is_main_process
+from nncf.utils import is_dist_avail_and_initialized
 from nncf.algo_selector import COMPRESSION_ALGORITHMS
 from nncf.structures import ModelEvaluationArgs
 
@@ -112,7 +115,8 @@ def create_compressed_model(model: Module, config: NNCFConfig,
     original_model_accuracy = None
     if should_eval_original_model:
         evaluation_args = config.get_extra_struct(ModelEvaluationArgs)
-        original_model_accuracy = evaluation_args.eval_fn(model, evaluation_args.data_loader)
+        with torch.no_grad():
+            original_model_accuracy = evaluation_args.eval_fn(model)
 
     compressed_model = NNCFNetwork(model, input_infos=input_info_list,
                                    dummy_forward_fn=dummy_forward_fn,
@@ -149,5 +153,20 @@ def create_compressed_model(model: Module, config: NNCFConfig,
 
             graph = compressed_graph_builder.build_graph(compressed_model, compressed_model.get_tracing_context())
             graph.visualize_graph(osp.join(config.get("log_dir", "."), "compressed_graph.dot"))
+
+    # Synchronize all processes if run in distributed mode
+    if is_dist_avail_and_initialized():
+        try:
+            barrier()
+        # Exception can be raised during running barrier
+        # if the backend not in the supported list https://pytorch.org/docs/stable/distributed.html
+        except RuntimeError as err:
+            logger.warning(err)
+            logger.warning(
+                "NNCF continues work, while does not guarantee that "
+                "the processes will finish model's compression at the same time. "
+                "If your training pipeline demands the processes be synchronized, please, "
+                "keep attention to that error")
+            return compression_ctrl, compressed_model
 
     return compression_ctrl, compressed_model

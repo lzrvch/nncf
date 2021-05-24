@@ -24,7 +24,7 @@ from nncf.sparsity.rb.layers import RBSparsifyingWeight
 from nncf.sparsity.rb.loss import SparseLoss, SparseLossForPerLayerSparsity
 from nncf.common.sparsity.schedulers import SPARSITY_SCHEDULERS
 from nncf.utils import get_world_size
-from nncf.common.accuracy_aware_training.algo import ACCURACY_AWARE_CONTROLLERS
+from nncf.common.accuracy_aware_training.training_loop import ADAPTIVE_COMPRESSION_CONTROLLERS
 
 
 @COMPRESSION_ALGORITHMS.register('rb_sparsity')
@@ -33,14 +33,15 @@ class RBSparsityBuilder(BaseSparsityAlgoBuilder):
         target_model = super().apply_to(target_model)
         return target_model
 
-    def create_weight_sparsifying_operation(self, module):
-        return RBSparsifyingWeight(module.weight.size(), frozen=False)
+    def create_weight_sparsifying_operation(self, module, compression_lr_multiplier):
+        return RBSparsifyingWeight(module.weight.size(), frozen=False,
+                                   compression_lr_multiplier=compression_lr_multiplier)
 
     def build_controller(self, target_model: NNCFNetwork) -> PTCompressionAlgorithmController:
         return RBSparsityController(target_model, self._sparsified_module_info, self.config)
 
 
-@ACCURACY_AWARE_CONTROLLERS.register('rb_sparsity')
+@ADAPTIVE_COMPRESSION_CONTROLLERS.register('rb_sparsity')
 class RBSparsityController(BaseSparsityAlgoController):
     def __init__(self, target_model: NNCFNetwork, sparsified_module_info: List[SparseModuleInfo], config):
         super().__init__(target_model, sparsified_module_info)

@@ -14,5 +14,6 @@
 from beta.nncf.tensorflow.helpers.model_creation import create_compressed_model as create_compressed_model_tf
 
 
-def create_compressed_model(model, config):
-    return create_compressed_model_tf(model, config)
+def create_compressed_model(model, config, should_eval_original_model=False):
+    return create_compressed_model_tf(model, config,
+                                      should_eval_original_model=should_eval_original_model)
